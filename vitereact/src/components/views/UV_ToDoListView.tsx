@@ -96,29 +96,48 @@ const fetchTasks = async (
   page: number,
   page_size: number
 ): Promise<{ tasks: Task[]; total_count: number }> => {
+  // Backend expects arrays as array parameters with style=form and explode=false (comma separated)
+  // axios default will serialize arrays with same key repeated (explode=true) which backend may not expect
+  // We manually serialize arrays into comma-separated strings for tags and assigned_user_ids
+
   const params: Record<string, any> = { task_list_id, page, page_size };
 
-  if (filters.status && filters.status.length > 0)
+  if (filters.status && filters.status.length > 0) {
     params.status = filters.status;
-  if (filters.tags && filters.tags.length > 0)
-    params.tags = filters.tags.join(',');
-  if (filters.assigned_user_ids && filters.assigned_user_ids.length > 0)
-    params.assigned_user_ids = filters.assigned_user_ids.join(',');
+  }
+  if (filters.tags && filters.tags.length > 0) {
+    // Provide as array for status, tags, assigned_user_ids (will be joined below)
+    params.tags = filters.tags;
+  }
+  if (filters.assigned_user_ids && filters.assigned_user_ids.length > 0) {
+    params.assigned_user_ids = filters.assigned_user_ids;
+  }
   if (filters.due_date_start) params.due_date_start = filters.due_date_start;
   if (filters.due_date_end) params.due_date_end = filters.due_date_end;
 
-  let sort_by_param = 'custom';
-  if (sorting.sort_by !== 'manual') {
-    // API uses 'custom' for manual
-    sort_by_param = sorting.sort_by;
-  }
+  // Map sorting 'manual' to backend expected 'custom'
+  let sort_by_param = sorting.sort_by === 'manual' ? 'custom' : sorting.sort_by;
+
   params.sort_by = sort_by_param;
   params.sort_order = sorting.sort_order;
+
+  // Manually serialize arrays to comma-separated string for correct API format
+  // axios paramsSerializer could also be used but keeping manual for clarity
+  // Override params before request
+  const serializedParams: Record<string, any> = {};
+  Object.entries(params).forEach(([key, value]) => {
+    if (Array.isArray(value)) {
+      if (value.length === 0) return; // skip empty arrays
+      serializedParams[key] = value.join(',');
+    } else if (value !== undefined && value !== null) {
+      serializedParams[key] = value;
+    }
+  });
 
   const { data } = await axios.get<{ tasks: Task[]; total_count: number }>(
     `${BASE_URL}/tasks`,
     {
-      params,
+      params: serializedParams,
       headers: { Authorization: `Bearer ${token}` },
     }
   );
@@ -231,7 +250,6 @@ const formatDateTime = (
   const d = new Date(isoStr);
   if (isNaN(d.getTime())) return '-';
 
-  // Adjust timezone offset (minutes)
   const localTime = new Date(d.getTime() + timezoneOffsetMins * 60 * 1000);
 
   return localTime.toLocaleString(undefined, {
@@ -470,7 +488,7 @@ const UV_ToDoListView: React.FC = () => {
   const mutationBulkUpdate = useMutation(
     (payload: BulkUpdatePayload) => bulkUpdateTasks(token, payload),
     {
-      onSuccess: (data) => {
+      onSuccess: () => {
         // Update task cache
         queryClient.invalidateQueries(['tasks', task_list_id]);
         // Clear selection, hide toast
@@ -536,8 +554,8 @@ const UV_ToDoListView: React.FC = () => {
   const [newTaskTitle, setNewTaskTitle] = useState('');
   const [newTaskDescription, setNewTaskDescription] = useState<string | null>(null);
   const [newTaskPriority, setNewTaskPriority] = useState<TaskPriority>('Medium');
-  const [newTaskDueDate, setNewTaskDueDate] = useState<string>(''); // "YYYY-MM-DD" for now
-  const [newTaskDueTime, setNewTaskDueTime] = useState<string>(''); // "HH:mm" for time input
+  const [newTaskDueDate, setNewTaskDueDate] = useState<string>('');
+  const [newTaskDueTime, setNewTaskDueTime] = useState<string>('');
 
   // Create task mutation
   const mutationCreateTask = useMutation(
@@ -545,13 +563,16 @@ const UV_ToDoListView: React.FC = () => {
       let due_datetime_iso: string | null = null;
       if (newTaskDueDate) {
         if (newTaskDueTime) {
-          const combined = `${newTaskDueDate}T${newTaskDueTime}:00.000Z`;
-          due_datetime_iso = new Date(combined).toISOString();
+          // Compose local datetime string
+          // Parse as local and get ISO string
+          const localDateTime = new Date(`${newTaskDueDate}T${newTaskDueTime}:00`);
+          if (!isNaN(localDateTime.getTime())) {
+            due_datetime_iso = localDateTime.toISOString();
+          }
         } else {
-          // Only date provided, parse as local date, convert to UTC start of day
           const d = new Date(newTaskDueDate);
           if (!isNaN(d.getTime())) {
-            due_datetime_iso = d.toISOString();
+            due_datetime_iso = new Date(d.getFullYear(), d.getMonth(), d.getDate()).toISOString();
           }
         }
       }
@@ -681,8 +702,19 @@ const UV_ToDoListView: React.FC = () => {
     setIsFilterPanelOpen(!isFilterPanelOpen);
   }
 
-  // Update URL search params in sync with filters and sorting (debounced)
-  const updateFiltersQuery = useCallback(
+  // Debounce utility for filter and sorting updates
+  const debounce = (fn: (...args: any[]) => void, delay: number) => {
+    let timeoutId: ReturnType<typeof setTimeout> | null = null;
+    return (...args: any[]) => {
+      if (timeoutId) clearTimeout(timeoutId);
+      timeoutId = setTimeout(() => {
+        fn(...args);
+        timeoutId = null;
+      }, delay);
+    };
+  };
+
+  const updateFiltersQueryRaw = useCallback(
     (newFilters: Partial<Filters>) => {
       // Compose new search params object from existing and new filters
       const updatedParams = new URLSearchParams(searchParams.toString());
@@ -715,8 +747,9 @@ const UV_ToDoListView: React.FC = () => {
     [searchParams, setSearchParams]
   );
 
-  // Update sorting query params
-  const updateSortingQuery = useCallback(
+  const updateFiltersQuery = useMemo(() => debounce(updateFiltersQueryRaw, 300), [updateFiltersQueryRaw]);
+
+  const updateSortingQueryRaw = useCallback(
     (newSorting: Partial<Sorting>) => {
       const updatedParams = new URLSearchParams(searchParams.toString());
       if (newSorting.sort_by) {
@@ -731,6 +764,8 @@ const UV_ToDoListView: React.FC = () => {
     },
     [searchParams, setSearchParams]
   );
+
+  const updateSortingQuery = useMemo(() => debounce(updateSortingQueryRaw, 300), [updateSortingQueryRaw]);
 
   // Update pagination page
   const setPage = (pageNum: number) => {
@@ -763,6 +798,7 @@ const UV_ToDoListView: React.FC = () => {
       }, 10000);
       return () => clearTimeout(timer);
     }
+    return undefined;
   }, [bulkActionUndoToastVisible]);
 
   // UX: keyboard shortcuts to toggle multi-select (Ctrl+M), select all (Ctrl+A) disabled for MVP simplicity
@@ -1068,10 +1104,11 @@ const UV_ToDoListView: React.FC = () => {
                     : 'bg-white dark:bg-gray-800'
                 }`}
                 style={{ paddingLeft: 16 + task.indentLevel * 24 }}
-                // Accessibility: keyboard navigation
                 tabIndex={0}
+                role="button"
                 onKeyDown={(e) => {
                   if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
                     navigate(`/tasks/${task.task_id}`);
                   }
                 }}
@@ -1176,8 +1213,16 @@ const UV_ToDoListView: React.FC = () => {
                 {/* Drag handle show only if not multi-select */}
                 {!multiSelectMode && (
                   <div
-                    className="cursor-move select-none text-gray-400 hover:text-gray-600 dark:hover:text-gray-300"
+                    role="button"
+                    tabIndex={0}
                     aria-label="Drag to reorder task"
+                    className="cursor-move select-none text-gray-400 hover:text-gray-600 dark:hover:text-gray-300"
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        // No native drag start, so no default action.
+                      }
+                    }}
                   >
                     ≡
                   </div>
